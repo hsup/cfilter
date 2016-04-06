@@ -1,0 +1,363 @@
+#!/usr/bin/perl -w
+
+# Project : Color Filter
+# Contact : hsup@motussoft.com
+#
+# ToDo's:
+#     1) config : config of color values 1-8 based on users terminal background color.
+#	Saving and reading config file ~/.cfilter.cfg
+#     2) option -T to also re-direct each of filtered pattern results to separate file in a directory.
+#	(e.g. "-T /tmp +1:radio +2:ActivityManager +3:Intent" will generate the dir+files:
+#	 /tmp/cfilter_{0_default.log, 1_radio.log, 2_ActivityManager.log, 3_Intent.log} )
+#	  "    -T, --TEE <out_dir>  : also saves pattern filtered outputs under <out_dir>.\n".
+#     3) Context:  " -c NUM  : print lines of context around matching lines.\n".
+#
+
+use Term::ANSIColor;
+use sigtrap qw(handler cleanup normal-signals error-signals);
+
+sub cleanup {
+	exit;
+}
+
+sub print_usage {
+	print "\n".
+		  "Usage:\n".
+		  "    cfilter [options] [+|-[<color>]:]<pattern> ...\n".
+		  "\n".
+		  "    Takes input from stdin, applies color to, and filters out, lines of text\n".
+		  "    that match specified patterns, and prints output to stdout.\n".
+		  "\n".
+		  "Options:\n".
+		  "    -I        : Case sensitive pattern matching.\n".
+		  "    -c NUM    : Show context (NUM lines) before & after matched patterns.\n".
+		  "                Default set to 1.\n".
+		  "    +0        : Print all non pattern matching lines in normal text color.\n".
+		  "                Turns off default context.\n".
+		  "    -0        : Filter & remove all non pattern matching lines.\n".
+		  "                Turns off default context.\n".
+		  "    +         : Includes lines that contain specified pattern.\n".
+		  "    -         : Excludes lines that contain specified pattern.\n".
+		  "    <color>   : 1-8 for level of color intensity:\n".
+		  "                red, magenta, blue, cyan, green, yellow, white, black.\n".
+		  "    <pattern> : May be in regexp.\n".
+		  "\n".
+		  "    -t, --tee <out_file> : also saves unmodified stdin to <out_file>.\n".
+		  "    --config (TODO)      : Configure default color settings.\n".
+		  "    -h, --help, --usage  : Print usage.\n".
+		  "\n".
+		  "Examples:\n".
+		  "    adb logcat | cfilter +3:\"ActivityManager.*Intent\"\n".
+		  "        Hi-lite in blue logs of ActivityManager processing intents.\n".
+		  "\n".
+		  "    adb logcat | cfilter +1:exception +1:\"E/\" +2:warning +2:\"W/\"\n".
+		  "        Hilite all errors / exceptions in red, and warnings in magenta.\n".
+		  "\n".
+		  "    adb logcat | cfilter photo sync\n".
+		  "        Hi-lite lines that contain the word \"photo\" or \"sync\".\n".
+		  "\n";
+}
+
+sub init {
+	$tee = 0;
+	$tee_file = "";
+	@context_buf = ();
+	$context_show = 1;
+	$context_buf_size = 1;
+	$context_buf_overflow = 0;
+	$context_buf_overflow_marker = "          < . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . >\n";
+	$post_match_count = -1;
+	$case_insensitive = 1;
+	$dim_no_match = 0;
+	$filter_no_match = 0;
+	@match_patterns = ();
+	@filter_patterns = ();
+	@colors = ();
+	@color_map = ( "bold red", "bold magenta", "bold blue", "bold cyan", "bold green", "bold yellow", "bold white", "bold black" );
+	$color_dim = "white";
+}
+
+sub configure_color {
+	# Todo.
+}
+
+sub is_number {
+	return ( ( defined $_[0] ) && ( $_[0] =~ /^\d$/ ) );
+}
+
+sub map_color_2_level {
+	if ( is_number( $_[0] ) && ( $_[0] > 0 ) && ( $_[0] <= $#color_map ) ) {
+		# Level is 1-8.
+		return ( $_[0] );
+	}
+	else { # if ( $_[0] eq "" ) {
+		# Lowest level priority.
+		return ( 99 );
+	}
+}
+
+sub map_level_2_color {
+	if ( is_number($_[0]) && ( $_[0] > 0 ) && ( $_[0] <= $#color_map ) ) {
+		return ( $color_map[ $_[0] - 1] );
+	}
+	else {
+		return "reset";
+	}
+}
+
+sub parse_args {
+	local( $arg );
+	local( $pattern );
+	local( $color );
+	local( $index );
+	local( $level );
+	local( $i );
+	local( $patternColorLevel ) = 1;
+
+	$level_order = ();
+
+	for ( $i = 0; $i <= $#ARGV; $i++ ) {
+		$arg = $ARGV[$i];
+
+		if ( $arg eq "-h" or $arg eq "--help" or $arg eq "--usage" ) {
+			print_usage();
+			exit;
+		}
+		elsif ( $arg eq "--config" or $arg eq "--configure" ) {
+			configure_color();
+			exit;
+		}
+		elsif ( ( $arg eq "-t" or $arg eq "--tee" ) && $i < $#ARGV )  {
+			$tee = 1;
+			$tee_file = $ARGV[++$i];
+		}
+		elsif ( $arg eq "-I" ) {
+			$case_insensitive = 0;
+		}
+		elsif ( $arg eq "-c" && $i < $#ARGV ) {
+			$context_buf_size = $ARGV[++$i];
+		}
+		elsif ( $arg eq "+0" ) {
+			$dim_no_match = 1;
+		}
+		elsif ( $arg eq "-0" ) {
+			$filter_no_match = 1;
+		}
+		elsif ( $arg =~ /^-:/ ) {
+			# "-:" Filter out pattern.
+			$pattern = substr( $arg, 2 );
+			if ( $pattern ne "" ) {
+				push( @filter_patterns, $pattern );
+			}
+		}
+		elsif ( $arg =~ /^\+.*:/ ) {
+			# "+<color>:" pattern.
+			$index = index( $arg, ":" );
+			$color = substr( $arg, 1, $index - 1);
+			$pattern = substr( $arg, $index + 1 );
+
+			if ( $pattern ne "" ) {
+				$level = &map_color_2_level( $color );
+				$index = find_insert_index( $level, $pattern );
+				splice( @level_order, $index, 0, "$level:$pattern" );
+				splice( @match_patterns, $index, 0, $pattern );
+				splice( @colors, $index, 0, &map_level_2_color( $color ) );
+			}
+		}
+		elsif ( $arg =~ /^[0-9a-zA-Z].*$/ ) {
+			$pattern = $arg;
+			$level = $patternColorLevel;
+			$index = find_insert_index( $level, $pattern );
+			splice( @level_order, $index, 0, "$level:$pattern" );
+			splice( @match_patterns, $index, 0, $pattern );
+			splice( @colors, $index, 0, &map_level_2_color( $level ) );
+
+			$patternColorLevel = ( $patternColorLevel % 8 ) + 1;
+		}
+	}
+
+	if ( $case_insensitive == 1 ) {
+		# Convert to lower case.
+		local( @lower_patterns ) = ();
+
+		for ( $i = 0; $i <= $#match_patterns; $i++ ) {
+			$pattern = $match_patterns[$i];
+			$pattern =~ tr/A-Z/a-z/;
+			push( @lower_patterns, $pattern );
+		}
+
+		@match_patterns = @lower_patterns;
+	}
+
+	if ( $dim_no_match != 0 || $filter_no_match != 0 ) {
+		$context_show = 0;
+		$context_buf_size = 0;
+	}
+
+	if ( $tee == 1 ) {
+		open( TEE_FILE, ">$tee_file" );
+	}
+}
+
+sub find_insert_index {
+	local( $i );
+	local( $key );
+	local( $index );
+	local( $level );
+	local( $pattern );
+	local( $len_1 ) = length( $_[1] );
+
+	if ( $#level_order < 0 ) {
+		return 0;
+	}
+
+	for ( $i = 0; $i <= $#level_order; $i++ ) {
+		$key = $level_order[$i];
+		$index = index( $key, ":" );
+		$level = substr( $key, 0, $index );
+		$pattern = substr( $key, $index + 1 );
+
+		if ( $_[0] < $level ) {
+			# Found.
+			return $i;
+		}
+
+		if ( $_[0] == $level ) {
+			if ( $len_1 > length( $pattern ) ) {
+				# Found.
+				return $i;
+			}
+		}
+	}
+
+	return $i;
+}
+
+sub context_buf_dump {
+	# Check for context overflow.
+	if ( $context_buf_overflow == 1 ) {
+		# print color $color_dim;
+		print $context_buf_overflow_marker;
+		# print color "reset";
+		$context_buf_overflow = 0;
+	}
+
+	# Print context buffer.
+	while ( $#context_buf >= 0 ) {
+		print color $color_dim;
+		print shift( @context_buf );
+		print color "reset";
+	}
+}
+
+sub context_buf_cache {
+	# Cache to context buffer.
+	push( @context_buf, $_ );
+	while ( $#context_buf + 1 > $context_buf_size ) {
+		shift( @context_buf );
+		$context_buf_overflow = 1;
+	}
+}
+
+sub print_n_highlight {
+	local( $pattern );
+	local( $i );
+	local( $in_line ) = $_;
+
+	if ( $tee ) {
+		print TEE_FILE $_;
+	}
+
+	if ( $case_insensitive ) {
+		# Lower case.
+		$in_line =~ tr/A-Z/a-z/;
+	}
+
+	# Look for matched patterns.
+	for ( $i = 0; $i <= $#match_patterns; $i++ ) {
+		$pattern = $match_patterns[$i];
+		if ( $in_line =~ /$pattern/ ) {
+			# Print pre-context.
+			if ( $context_show != 0 ) {
+				&context_buf_dump;
+			}
+
+			# Reset post-match count.
+			$post_match_count = 0;
+
+			# Print color for matched line.
+			print color $colors[$i];
+			print $_;
+			print color "reset";
+
+			return;
+		}
+	}
+
+	# Look for exclude patterns.
+	for ( $i = 0; $i <= $#filter_patterns; $i++ ) {
+		$pattern = $filter_patterns[$i];
+		if ( $in_line =~ /$pattern/ ) {
+			return;  # Filter out text by skipping line.
+		}
+	}
+
+	# No pattern matched.
+	if ( $filter_no_match ) {
+		# -0 arg.  Filter out text line.
+		return;  # Filter out text by skipping line.
+	}
+
+	if ( $dim_no_match ) {
+		# +0 arg.  Dim text line.
+		print color $color_dim;
+		print $_;
+		print color "reset";
+
+		return;
+	}
+
+	if ( $context_show != 0 ) {
+		# Cache to context buffer.
+		&context_buf_cache( $_ );
+
+		# Print post-context.
+		if ( $post_match_count >= 0 ) {
+			$post_match_count = $post_match_count + 1; 
+			if ( $post_match_count == $context_buf_size ) {
+				&context_buf_dump;
+			}
+		}
+
+		return;
+	}
+}
+
+# if ( $#ARGV < 0 ) {
+# 	print_usage();
+# 	exit;
+# }
+
+&init;
+
+&parse_args;
+
+&print_n_highlight( $_ ) while ( <STDIN> );
+
+if ( $context_show ) {
+	if ( $post_match_count < $context_buf_size ) {
+		context_buf_dump;
+	}
+	elsif ( $post_match_count != $context_buf_size ) {
+		# print color $color_dim;
+		print $context_buf_overflow_marker;
+		# print color "reset";
+	}
+}
+
+END {
+	if ( $tee ) {
+		close( TEE_FILE );
+	}
+	print color "reset";
+}
