@@ -69,7 +69,7 @@ sub init {
 	$post_match_count = -1;
 	$case_insensitive = 1;
 	$dim_no_match = 0;
-	$filter_no_match = 0;
+	$filter_no_match = 1;
 	@match_patterns = ();
 	@filter_patterns = ();
 	@colors = ();
@@ -136,9 +136,11 @@ sub parse_args {
 		}
 		elsif ( $arg eq "-c" && $i < $#ARGV ) {
 			$context_buf_size = $ARGV[++$i];
+			$filter_no_match = 0;
 		}
 		elsif ( $arg eq "+0" ) {
 			$dim_no_match = 1;
+			$filter_no_match = 0;
 		}
 		elsif ( $arg eq "-0" ) {
 			$filter_no_match = 1;
@@ -179,14 +181,20 @@ sub parse_args {
 	if ( $case_insensitive == 1 ) {
 		# Convert to lower case.
 		local( @lower_patterns ) = ();
-
 		for ( $i = 0; $i <= $#match_patterns; $i++ ) {
 			$pattern = $match_patterns[$i];
 			$pattern =~ tr/A-Z/a-z/;
 			push( @lower_patterns, $pattern );
 		}
-
 		@match_patterns = @lower_patterns;
+
+		local( @lower_patterns ) = ();
+		for ( $i = 0; $i <= $#filter_patterns; $i++ ) {
+			$pattern = $filter_patterns[$i];
+			$pattern =~ tr/A-Z/a-z/;
+			push( @lower_patterns, $pattern );
+		}
+		@filter_patterns = @lower_patterns;
 	}
 
 	if ( $dim_no_match != 0 || $filter_no_match != 0 ) {
@@ -273,6 +281,14 @@ sub print_n_highlight {
 		$in_line =~ tr/A-Z/a-z/;
 	}
 
+	# Look for exclude patterns.
+	for ( $i = 0; $i <= $#filter_patterns; $i++ ) {
+		$pattern = $filter_patterns[$i];
+		if ( $in_line =~ /$pattern/ ) {
+			return;  # Filter out text by skipping line.
+		}
+	}
+
 	# Look for matched patterns.
 	for ( $i = 0; $i <= $#match_patterns; $i++ ) {
 		$pattern = $match_patterns[$i];
@@ -291,14 +307,6 @@ sub print_n_highlight {
 			print color "reset";
 
 			return;
-		}
-	}
-
-	# Look for exclude patterns.
-	for ( $i = 0; $i <= $#filter_patterns; $i++ ) {
-		$pattern = $filter_patterns[$i];
-		if ( $in_line =~ /$pattern/ ) {
-			return;  # Filter out text by skipping line.
 		}
 	}
 
